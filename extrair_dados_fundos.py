@@ -3,6 +3,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import json
 import re
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +30,7 @@ DEFAULT_CURRENCY_FALLBACKS: list[str | None] = [
     "AUD",
     None,
 ]
+TEARSHEET_TYPES = ("funds", "equities", "etfs")
 
 
 def _extract_price_currency(soup: BeautifulSoup) -> str | None:
@@ -45,12 +47,27 @@ def _extract_price_currency(soup: BeautifulSoup) -> str | None:
 
 
 def _extract_first_tearsheet_link(soup: BeautifulSoup) -> str | None:
-    """Na pagina de busca, pega o primeiro link de tearsheet de fundo."""
+    """Na pagina de busca, pega o primeiro link de tearsheet suportado."""
     for a in soup.find_all("a", href=True):
         href = a.get("href") or ""
-        if "/data/funds/tearsheet/" in href:
+        if any(f"/data/{asset}/tearsheet/" in href for asset in TEARSHEET_TYPES):
             return href if href.startswith("http") else f"{BASE_URL}{href}"
     return None
+
+
+def _extract_first_tearsheet_link_for_asset(soup: BeautifulSoup, asset_type: str) -> str | None:
+    """Na pagina de busca, pega o primeiro link do tipo de ativo desejado."""
+    expected = f"/data/{asset_type}/tearsheet/"
+    fallback = None
+    for a in soup.find_all("a", href=True):
+        href = a.get("href") or ""
+        if any(f"/data/{asset}/tearsheet/" in href for asset in TEARSHEET_TYPES):
+            full = href if href.startswith("http") else f"{BASE_URL}{href}"
+            if expected in href:
+                return full
+            if fallback is None:
+                fallback = full
+    return fallback
 
 
 def _extract_xid_and_name(soup: BeautifulSoup, html_text: str) -> tuple[str | None, str | None]:
@@ -86,6 +103,86 @@ def _extract_xid_and_name(soup: BeautifulSoup, html_text: str) -> tuple[str | No
     return None, None
 
 
+def _extract_asset_class(soup: BeautifulSoup, html_text: str) -> str | None:
+    """Extrai asset class (fund/equity/etf) quando disponível."""
+    section = soup.find("section", class_="mod-tearsheet-add-to-watchlist")
+    if section and section.get("data-mod-config"):
+        try:
+            config = json.loads(section["data-mod-config"])
+            value = str(config.get("assetClass", "")).strip().lower()
+            if value:
+                return value
+        except Exception:
+            pass
+
+    match = re.search(r"\"assetClass\"\\s*:\\s*\"([^\"]+)\"", html_text)
+    if match:
+        return match.group(1).strip().lower()
+    return None
+
+
+def _extract_symbol(soup: BeautifulSoup, html_text: str) -> str | None:
+    """Extrai symbol FT (ex.: IE00...:USD, AAPL:NSQ, AGG:NZC)."""
+    section = soup.find("section", class_="mod-tearsheet-add-to-watchlist")
+    if section and section.get("data-mod-config"):
+        try:
+            config = json.loads(section["data-mod-config"])
+            value = str(config.get("symbol", "")).strip().upper()
+            if value:
+                return value
+        except Exception:
+            pass
+
+    match = re.search(r"\"symbol\"\\s*:\\s*\"([^\"]+)\"", html_text)
+    if match:
+        return match.group(1).strip().upper()
+    return None
+
+
+def _parse_ft_number(value: str | None) -> float:
+    """Converte numero FT (ex.: 1,234.56 / 2.7m / 1.2b / -) para float."""
+    if value is None:
+        return math.nan
+
+    text = str(value).strip().lower().replace(",", "")
+    if text in {"", "-", "n/a", "na", "null"}:
+        return math.nan
+
+    match = re.fullmatch(r"([+-]?\d*\.?\d+)\s*([kmbt])?", text)
+    if match:
+        base = float(match.group(1))
+        suffix = match.group(2)
+        factor = {
+            None: 1.0,
+            "k": 1e3,
+            "m": 1e6,
+            "b": 1e9,
+            "t": 1e12,
+        }[suffix]
+        return base * factor
+
+    compact = re.sub(r"[^0-9.\-+]", "", text)
+    if compact in {"", "-", "+", ".", "-.", "+."}:
+        return math.nan
+    try:
+        return float(compact)
+    except Exception:
+        return math.nan
+
+
+def _infer_asset_type_from_url(url: str) -> str:
+    lower_url = str(url).lower()
+    if "/data/equities/" in lower_url:
+        return "equities"
+    if "/data/etfs/" in lower_url:
+        return "etfs"
+    return "funds"
+
+
+def _looks_like_isin(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{10}", value.strip().upper()))
+
+
 # ============================
 # 1. Dado ISIN -> pegar XID
 # ============================
@@ -95,42 +192,67 @@ def get_xid_from_isin(
     currency: str | None = "USD"
 ) -> tuple[str, str, str | None]:
     isin = isin.strip().upper()
-    url = f"{BASE_URL}/data/funds/tearsheet/historical"
-    symbol = f"{isin}:{currency}" if currency else isin
-    params = {"s": symbol}
+    is_isin = _looks_like_isin(isin)
+    # Para tickers/symbols (AAPL, AGG, SPY etc), nao forcar sufixo de moeda.
+    symbol = f"{isin}:{currency}" if (currency and is_isin) else isin
+    attempts = []
 
-    r = session.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
+    asset_order = TEARSHEET_TYPES if is_isin else ("equities", "etfs", "funds")
+    for asset_type in asset_order:
+        url = f"{BASE_URL}/data/{asset_type}/tearsheet/historical"
+        attempts.append((url, {"s": symbol}))
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    xid, fund_name = _extract_xid_and_name(soup, r.text)
-    if xid:
-        # Quando o tearsheet mostra moeda original diferente, tenta a classe detectada.
-        detected_currency = _extract_price_currency(soup)
-        if detected_currency and currency and detected_currency != currency:
-            alt_params = {"s": f"{isin}:{detected_currency}"}
-            rr = session.get(url, headers=HEADERS, params=alt_params, timeout=REQUEST_TIMEOUT)
-            rr.raise_for_status()
-            soup_alt = BeautifulSoup(rr.text, "html.parser")
-            xid_alt, fund_name_alt = _extract_xid_and_name(soup_alt, rr.text)
-            if xid_alt:
-                return xid_alt, rr.url, fund_name_alt or fund_name
-        return xid, r.url, fund_name
+    for url, params in attempts:
+        r = session.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    title_tag = soup.find("h1")
-    title_text = title_tag.get_text(" ", strip=True).lower() if title_tag else ""
-    if title_text == "search":
-        first_link = _extract_first_tearsheet_link(soup)
-        if first_link:
-            rr = session.get(first_link, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            rr.raise_for_status()
-            soup2 = BeautifulSoup(rr.text, "html.parser")
-            xid2, fund_name2 = _extract_xid_and_name(soup2, rr.text)
-            if xid2:
-                return xid2, rr.url, fund_name2
-        raise RuntimeError("Página de busca do FT: ISIN/moeda não encontrado.")
+        xid, fund_name = _extract_xid_and_name(soup, r.text)
+        if xid:
+            detected_asset_class = _extract_asset_class(soup, r.text)
+            effective_asset_type = (
+                _infer_asset_type_from_url(r.url)
+                if _infer_asset_type_from_url(r.url)
+                else (detected_asset_class or "funds")
+            )
+            if detected_asset_class == "equity":
+                effective_asset_type = "equities"
+            elif detected_asset_class == "etf":
+                effective_asset_type = "etfs"
+            elif detected_asset_class == "fund":
+                effective_asset_type = "funds"
 
-    raise RuntimeError("Não foi possível extrair o XID do tearsheet do FT.")
+            # Fundos podem estar em outra moeda no FT; tenta novamente com moeda detectada.
+            detected_currency = _extract_price_currency(soup)
+            if effective_asset_type == "funds" and detected_currency and currency and detected_currency != currency:
+                alt_url = f"{BASE_URL}/data/funds/tearsheet/historical"
+                alt_params = {"s": f"{isin}:{detected_currency}"}
+                rr = session.get(alt_url, headers=HEADERS, params=alt_params, timeout=REQUEST_TIMEOUT)
+                rr.raise_for_status()
+                soup_alt = BeautifulSoup(rr.text, "html.parser")
+                xid_alt, fund_name_alt = _extract_xid_and_name(soup_alt, rr.text)
+                if xid_alt:
+                    return xid_alt, rr.url, fund_name_alt or fund_name
+            return xid, r.url, fund_name
+
+        title_tag = soup.find("h1")
+        title_text = title_tag.get_text(" ", strip=True).lower() if title_tag else ""
+        if title_text == "search":
+            first_link = _extract_first_tearsheet_link_for_asset(soup, asset_type)
+            if first_link:
+                rr = session.get(first_link, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+                rr.raise_for_status()
+                soup2 = BeautifulSoup(rr.text, "html.parser")
+                xid2, fund_name2 = _extract_xid_and_name(soup2, rr.text)
+                if xid2:
+                    symbol2 = _extract_symbol(soup2, rr.text)
+                    if symbol2 and "?s=" not in rr.url:
+                        rr_url = f"{rr.url}?s={symbol2}"
+                    else:
+                        rr_url = rr.url
+                    return xid2, rr_url, fund_name2
+
+    raise RuntimeError("Não foi possível extrair o XID no FT (funds/equities/etfs).")
 
 
 # ==================================
@@ -217,12 +339,7 @@ def get_historical_data(
         format="%A, %B %d, %Y"
     )
     for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = (
-            df[col]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .astype(float)
-        )
+        df[col] = df[col].map(_parse_ft_number)
 
     return df.sort_values("Date")
 
