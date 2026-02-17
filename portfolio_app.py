@@ -2601,7 +2601,7 @@ if app_mode == "Comparador de Ativos":
         )
         picked_ft = _live_ft_searchbox(
             "Adicionar para comparação (nome, ISIN ou ticker)",
-            "Digite.",
+            "Explorar.",
             key_prefix="cmp_ft",
             asset_filter=cmp_asset_filter,
         )
@@ -2800,7 +2800,7 @@ with st.container(border=True):
     )
     picked_ft = _live_ft_searchbox(
         "Adicionar ativo (nome, ISIN ou ticker)",
-        "Digite.",
+        "Explorar.",
         key_prefix="sim_ft",
         asset_filter=sim_asset_filter,
     )
