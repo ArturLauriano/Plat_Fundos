@@ -4,6 +4,7 @@ import re
 import tempfile
 import time
 import html
+import base64
 from difflib import SequenceMatcher
 from datetime import datetime, date
 from pathlib import Path
@@ -1026,8 +1027,7 @@ def _filter_failed_isins(
     return kept_isins, np.array(kept_weights), kept_classes
 
 
-def load_saved_portfolios() -> dict:
-    """Carrega carteiras salvas do arquivo local."""
+def _local_load_portfolios() -> dict:
     if PORTFOLIO_FILE.exists():
         try:
             with PORTFOLIO_FILE.open("r", encoding="utf-8") as f:
@@ -1039,10 +1039,172 @@ def load_saved_portfolios() -> dict:
     return {}
 
 
-def save_all_portfolios(portfolios: dict):
-    """Persiste o dicionário completo de carteiras."""
+def _local_save_portfolios(portfolios: dict):
     with PORTFOLIO_FILE.open("w", encoding="utf-8") as f:
         json.dump(portfolios, f, ensure_ascii=False, indent=2)
+
+
+def _github_persistence_config() -> dict:
+    """Configuração opcional para persistir carteiras no GitHub (Streamlit Cloud)."""
+    try:
+        section = st.secrets.get("github_persistence", {})
+    except Exception:
+        section = {}
+    if not isinstance(section, dict):
+        section = {}
+
+    def _secret_pick(section_key: str, root_key: str, default: str = "") -> str:
+        sec_val = section.get(section_key, "")
+        if sec_val not in (None, ""):
+            return str(sec_val).strip()
+        try:
+            root_val = st.secrets.get(root_key, "")
+        except Exception:
+            root_val = ""
+        if root_val in (None, ""):
+            return default
+        return str(root_val).strip()
+
+    repo = _secret_pick("repo", "GITHUB_PERSISTENCE_REPO", "")
+    token = _secret_pick("token", "GITHUB_PERSISTENCE_TOKEN", "")
+    branch = _secret_pick("branch", "GITHUB_PERSISTENCE_BRANCH", "main") or "main"
+    file_path = _secret_pick("file_path", "GITHUB_PERSISTENCE_FILE", "carteiras.json") or "carteiras.json"
+    commit_message = _secret_pick(
+        "commit_message",
+        "GITHUB_PERSISTENCE_COMMIT_MESSAGE",
+        "Atualiza carteiras salvas",
+    )
+    enabled_raw = _secret_pick("enabled", "GITHUB_PERSISTENCE_ENABLED", "")
+    enabled = str(enabled_raw).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        enabled = bool(repo and token)
+
+    return {
+        "enabled": enabled,
+        "repo": repo,
+        "token": token,
+        "branch": branch,
+        "file_path": file_path,
+        "commit_message": commit_message,
+    }
+
+
+def _github_api_headers(token: str) -> dict:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _load_portfolios_from_github(cfg: dict) -> dict | None:
+    """Retorna dicionário de carteiras do GitHub ou None em falha."""
+    if not cfg.get("enabled"):
+        return None
+
+    import requests
+
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['file_path']}"
+    try:
+        resp = requests.get(
+            url,
+            headers=_github_api_headers(cfg["token"]),
+            params={"ref": cfg["branch"]},
+            timeout=20,
+        )
+        if resp.status_code == 404:
+            st.session_state["portfolio_persistence_last_error"] = ""
+            return {}
+        resp.raise_for_status()
+        payload = resp.json()
+        content_b64 = str(payload.get("content", "")).strip()
+        if not content_b64:
+            st.session_state["portfolio_persistence_last_error"] = ""
+            return {}
+        content_txt = base64.b64decode(content_b64).decode("utf-8")
+        data = json.loads(content_txt) if content_txt.strip() else {}
+        if not isinstance(data, dict):
+            raise ValueError("Formato inválido de carteiras no GitHub (esperado objeto JSON).")
+        st.session_state["portfolio_persistence_last_error"] = ""
+        return data
+    except Exception as exc:
+        st.session_state["portfolio_persistence_last_error"] = str(exc)
+        return None
+
+
+def _save_portfolios_to_github(cfg: dict, portfolios: dict) -> bool:
+    """Persiste carteiras no GitHub; retorna True quando gravou com sucesso."""
+    if not cfg.get("enabled"):
+        return False
+
+    import requests
+
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['file_path']}"
+    headers = _github_api_headers(cfg["token"])
+    sha = None
+
+    try:
+        get_resp = requests.get(
+            url,
+            headers=headers,
+            params={"ref": cfg["branch"]},
+            timeout=20,
+        )
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha")
+        elif get_resp.status_code != 404:
+            get_resp.raise_for_status()
+
+        content_txt = json.dumps(portfolios, ensure_ascii=False, indent=2)
+        body = {
+            "message": cfg["commit_message"],
+            "content": base64.b64encode(content_txt.encode("utf-8")).decode("utf-8"),
+            "branch": cfg["branch"],
+        }
+        if sha:
+            body["sha"] = sha
+
+        put_resp = requests.put(url, headers=headers, json=body, timeout=25)
+        put_resp.raise_for_status()
+        st.session_state["portfolio_persistence_last_error"] = ""
+        return True
+    except Exception as exc:
+        st.session_state["portfolio_persistence_last_error"] = str(exc)
+        return False
+
+
+def load_saved_portfolios() -> dict:
+    """Carrega carteiras salvas (GitHub quando configurado; fallback local)."""
+    cfg = _github_persistence_config()
+    if cfg.get("enabled"):
+        remote = _load_portfolios_from_github(cfg)
+        if isinstance(remote, dict):
+            _local_save_portfolios(remote)
+            st.session_state["portfolio_persistence_backend"] = "github"
+            return remote
+        st.session_state["portfolio_persistence_backend"] = "local_fallback"
+        return _local_load_portfolios()
+
+    st.session_state["portfolio_persistence_backend"] = "local"
+    return _local_load_portfolios()
+
+
+def save_all_portfolios(portfolios: dict):
+    """Persiste o dicionário completo de carteiras."""
+    safe_portfolios = portfolios if isinstance(portfolios, dict) else {}
+    cfg = _github_persistence_config()
+    saved_remote = False
+    if cfg.get("enabled"):
+        saved_remote = _save_portfolios_to_github(cfg, safe_portfolios)
+
+    _local_save_portfolios(safe_portfolios)
+
+    if cfg.get("enabled"):
+        st.session_state["portfolio_persistence_backend"] = "github" if saved_remote else "local_fallback"
+    else:
+        st.session_state["portfolio_persistence_backend"] = "local"
 
 
 def save_portfolio(name: str, data: dict):
@@ -2330,7 +2492,21 @@ with st.sidebar:
 
     st.divider()
     with st.expander("Gerenciar carteiras", expanded=False):
-        current_portfolios = load_saved_portfolios()
+        current_portfolios = dict(portfolios)
+        storage_backend = str(st.session_state.get("portfolio_persistence_backend", "local")).strip().lower()
+        cfg_persist = _github_persistence_config()
+        if cfg_persist.get("enabled"):
+            if storage_backend == "github":
+                st.caption("Persistência: GitHub (online).")
+            else:
+                st.caption("Persistência: fallback local (falha no GitHub).")
+                last_err = str(st.session_state.get("portfolio_persistence_last_error", "")).strip()
+                if last_err:
+                    st.caption(f"Erro GitHub: {last_err[:180]}")
+        else:
+            st.caption("Persistência: local (arquivo da sessão).")
+            st.caption("Para persistir online, configure `github_persistence` em `st.secrets`.")
+
         saved_names = sorted(current_portfolios.keys())
         if saved_names:
             delete_target = st.selectbox(
@@ -2380,7 +2556,7 @@ with st.sidebar:
                 if import_mode == "Substituir":
                     merged = incoming
                 else:
-                    merged = load_saved_portfolios()
+                    merged = dict(current_portfolios)
                     merged.update(incoming)
                 save_all_portfolios(merged)
                 st.success(f"{len(incoming)} carteira(s) importada(s).")
