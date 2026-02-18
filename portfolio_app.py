@@ -479,11 +479,10 @@ def _live_ft_searchbox(
 ) -> dict | None:
     """Barra única com dropdown de sugestões; retorna item FT selecionado."""
     try:
-        from streamlit_searchbox import st_searchbox
+        from streamlit_searchbox_local import st_searchbox
     except Exception:
         st.error(
-            "Autocomplete em tempo real requer `streamlit-searchbox`. "
-            "Instale com: `pip install -r requirements.txt`."
+            "Autocomplete em tempo real indisponível: componente local `streamlit_searchbox_local` não encontrado."
         )
         return None
 
@@ -491,6 +490,8 @@ def _live_ft_searchbox(
         st.caption(label)
 
     is_light = _is_light_theme_active()
+    # O searchbox roda em iframe; menu/menuPortal dependem do patch local.
+    # Se atualizar o pacote upstream, reaplique o patch no fork local.
     style_overrides = None
     if is_light:
         style_overrides = {
@@ -520,6 +521,9 @@ def _live_ft_searchbox(
                     "border": "1px solid #cbd5e1",
                     "boxShadow": "none",
                     "marginTop": "0",
+                },
+                "menuPortal": {
+                    "zIndex": 1000,
                 },
                 "menuList": {
                     "backgroundColor": "#ffffff",
@@ -561,6 +565,9 @@ def _live_ft_searchbox(
                 "singleValue": {"color": "#e5e7eb"},
                 "placeholder": {"color": "#94a3b8"},
                 "menu": {"backgroundColor": "#0f172a", "border": "1px solid #334155"},
+                "menuPortal": {
+                    "zIndex": 1000,
+                },
                 "menuList": {
                     "backgroundColor": "#0f172a",
                     "paddingTop": "0",
@@ -1433,9 +1440,13 @@ def _plot_corr_heatmap(corr: pd.DataFrame, title: str, key: str | None = None):
     st.plotly_chart(fig, use_container_width=True, key=key, config={"displaylogo": False})
 
 
-def _show_dataframe_themed(df: pd.DataFrame, use_container_width: bool = True):
+def _show_dataframe_themed(df: pd.DataFrame, use_container_width: bool = True, show_index: bool = True):
     """Renderiza tabela simples; o tema é controlado via CSS global."""
-    st.table(df)
+    if show_index:
+        st.table(df)
+        return
+    df_to_render = df.reset_index(drop=True)
+    st.table(df_to_render)
 
 
 def _render_ft_links_table(links_df: pd.DataFrame):
@@ -1447,14 +1458,14 @@ def _render_ft_links_table(links_df: pd.DataFrame):
     rows_html: list[str] = []
     for _, row in links_df.iterrows():
         fundo = html.escape(str(row.get("Fundo", "")))
-        isin = html.escape(str(row.get("ISIN", "")))
+        ticker_isin = html.escape(str(row.get("Ticker/ISIN", row.get("ISIN", ""))))
         summary = html.escape(str(row.get("FT Summary", "")))
         risk = html.escape(str(row.get("FT Risk", "")))
         rows_html.append(
             (
                 "<tr>"
                 f"<td>{fundo}</td>"
-                f"<td>{isin}</td>"
+                f"<td>{ticker_isin}</td>"
                 f"<td><a href=\"{summary}\" target=\"_blank\" rel=\"noopener noreferrer\">{summary}</a></td>"
                 f"<td><a href=\"{risk}\" target=\"_blank\" rel=\"noopener noreferrer\">{risk}</a></td>"
                 "</tr>"
@@ -1465,7 +1476,7 @@ def _render_ft_links_table(links_df: pd.DataFrame):
         (
             "<div class=\"ft-links-wrap\">"
             "<table class=\"ft-links-table\">"
-            "<thead><tr><th>Fundo</th><th>ISIN</th><th>FT Summary</th><th>FT Risk</th></tr></thead>"
+            "<thead><tr><th>Fundo</th><th>Ticker/ISIN</th><th>FT Summary</th><th>FT Risk</th></tr></thead>"
             f"<tbody>{''.join(rows_html)}</tbody>"
             "</table>"
             "</div>"
@@ -1511,6 +1522,39 @@ def _render_assets_grid_table(funds_df: pd.DataFrame, option_to_isin: dict[str, 
     )
 
 
+def _render_compare_grid_table(df: pd.DataFrame):
+    """Renderiza grades do comparador sem índice (controle total do HTML)."""
+    if df is None or df.empty:
+        st.info("Sem dados para exibir.")
+        return
+
+    columns = [str(col) for col in df.columns]
+    header_html = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
+    rows_html: list[str] = []
+    for _, row in df.iterrows():
+        cells: list[str] = []
+        for col in columns:
+            value = row.get(col, "")
+            if pd.isna(value):
+                text_value = ""
+            else:
+                text_value = str(value)
+            cells.append(f"<td>{html.escape(text_value)}</td>")
+        rows_html.append("<tr>" + "".join(cells) + "</tr>")
+
+    st.markdown(
+        (
+            "<div class=\"assets-grid-wrap\">"
+            "<table class=\"assets-grid-table\">"
+            f"<thead><tr>{header_html}</tr></thead>"
+            f"<tbody>{''.join(rows_html)}</tbody>"
+            "</table>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def _collect_fund_colors(labels: list[str], key_prefix: str) -> dict[str, str]:
     """Permite ao usuário customizar cores por fundo."""
     colors: dict[str, str] = {}
@@ -1522,6 +1566,318 @@ def _collect_fund_colors(labels: list[str], key_prefix: str) -> dict[str, str]:
             key = f"{key_prefix}_color_{safe}_{idx}"
             colors[str(label)] = st.color_picker(str(label), value=default, key=key)
     return colors
+
+
+def _render_compare_multiselect_css(is_light: bool):
+    """Estilo dedicado para o multiselect do comparador (No results e popover)."""
+    if is_light:
+        css = """
+<style>
+/* Com theme.base=dark, o stMultiSelect precisa override dedicado no comparador. */
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+  background: #ffffff !important;
+  color: #111827 !important;
+  border-color: #cbd5e1 !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] > div:hover,
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] > div:focus-within {
+  border-color: #94a3b8 !important;
+  box-shadow: none !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] input,
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] span,
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] div {
+  color: #111827 !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] svg {
+  fill: #64748b !important;
+}
+/* Dropdown inline (dentro do próprio widget) */
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="menu"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [id*="react-select"][class*="-menu"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [id*="react-select"][class*="-menu-list"] {
+  background: #ffffff !important;
+  color: #111827 !important;
+  border-color: #cbd5e1 !important;
+  box-shadow: none !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"] div,
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"] li[role="option"] {
+  background: #ffffff !important;
+  color: #111827 !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [class*="menu-notice"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [class*="notice"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [class*="no-options"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [aria-live="polite"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [aria-live="assertive"] {
+  background: #ffffff !important;
+  color: #334155 !important;
+}
+/* Remove o dropdown quando não há resultados. */
+@supports selector(:has(*)) {
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"]:has([class*="menu-notice"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"]:has([class*="notice"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"]:has([class*="no-options"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"]:has([class*="menu-notice"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"]:has([class*="notice"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"]:has([class*="no-options"]) {
+    display: none !important;
+  }
+}
+/* Dropdown portaled: escopo pelo comparador aberto quando :has existir. */
+@supports selector(:has(*)) {
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="menu"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="menu"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [role="listbox"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [id*="react-select"][class*="-menu"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [id*="react-select"][class*="-menu"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [id*="react-select"][class*="-menu-list"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [id*="react-select"][class*="-menu-list"] {
+    background: #ffffff !important;
+    color: #111827 !important;
+    border-color: #cbd5e1 !important;
+    box-shadow: none !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"] div,
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [role="listbox"] div,
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"] li[role="option"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [role="listbox"] li[role="option"] {
+    background: #ffffff !important;
+    color: #111827 !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [class*="menu-notice"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [class*="menu-notice"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [class*="notice"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [class*="notice"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [class*="no-options"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [class*="no-options"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [aria-live="polite"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [aria-live="polite"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [aria-live="assertive"],
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [aria-live="assertive"] {
+    background: #ffffff !important;
+    color: #334155 !important;
+  }
+  /* Opcional: se não há opções, colapsa painel vazio. */
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:has([role="listbox"]:not(:has(li[role="option"]))) {
+    display: none !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"]:has([role="listbox"]:not(:has(li[role="option"]))) {
+    display: none !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"]:not(:has(li[role="option"])),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [role="listbox"]:not(:has(li[role="option"])) {
+    display: none !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:has([class*="menu-notice"]),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"]:has([class*="menu-notice"]),
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:has([class*="notice"]),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"]:has([class*="notice"]),
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:has([class*="no-options"]),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"]:has([class*="no-options"]) {
+    display: none !important;
+  }
+}
+/* Fallback sem :has: aplica fundo completo para evitar faixa escura. */
+@supports not selector(:has(*)) {
+  body [data-baseweb="popover"],
+  body [data-baseweb="menu"],
+  body [role="listbox"],
+  body [id*="react-select"][class*="-menu"],
+  body [id*="react-select"][class*="-menu-list"] {
+    background: #ffffff !important;
+    color: #111827 !important;
+    border-color: #cbd5e1 !important;
+    box-shadow: none !important;
+  }
+  body [role="listbox"] div,
+  body [role="listbox"] li[role="option"] {
+    background: #ffffff !important;
+    color: #111827 !important;
+  }
+  body [role="listbox"] * {
+    background: #ffffff !important;
+  }
+  body [class*="menu-notice"],
+  body [class*="notice"],
+  body [class*="no-options"],
+  body [aria-live="polite"],
+  body [aria-live="assertive"] {
+    background: #ffffff !important;
+    color: #334155 !important;
+    min-height: 1.4rem !important;
+    padding: 0.2rem 0.45rem !important;
+  }
+}
+/* Esconde o dropdown apenas quando não há opções (No results). */
+@supports selector(:has(*)) {
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"]:not(:has([role="option"])),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"]:not(:has([role="option"])) {
+    display: none !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:not(:has([role="option"])),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"]:not(:has([role="option"])),
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"]:not(:has([role="option"])),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [role="listbox"]:not(:has([role="option"])) {
+    display: none !important;
+  }
+}
+</style>
+"""
+    else:
+        css = """
+<style>
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+  background: #0f172a !important;
+  color: #e5e7eb !important;
+  border-color: #223041 !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] > div:hover,
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] > div:focus-within {
+  border-color: #475569 !important;
+  box-shadow: none !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] input,
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] span,
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="select"] div {
+  color: #e5e7eb !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] svg {
+  fill: #94a3b8 !important;
+}
+/* Dropdown inline (dentro do próprio widget) */
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="menu"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [id*="react-select"][class*="-menu"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [id*="react-select"][class*="-menu-list"] {
+  background: #0f172a !important;
+  color: #e5e7eb !important;
+  border-color: #334155 !important;
+  box-shadow: none !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"] div,
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"] li[role="option"] {
+  background: #0f172a !important;
+  color: #e5e7eb !important;
+}
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [class*="menu-notice"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [class*="notice"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [class*="no-options"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [aria-live="polite"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [aria-live="assertive"] {
+  background: #0f172a !important;
+  color: #94a3b8 !important;
+}
+/* Remove o dropdown quando não há resultados. */
+@supports selector(:has(*)) {
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"]:has([class*="menu-notice"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"]:has([class*="notice"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"]:has([class*="no-options"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"]:has([class*="menu-notice"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"]:has([class*="notice"]),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"]:has([class*="no-options"]) {
+    display: none !important;
+  }
+}
+/* Dropdown portaled: escopo pelo comparador aberto quando :has existir. */
+@supports selector(:has(*)) {
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="menu"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [id*="react-select"][class*="-menu"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [id*="react-select"][class*="-menu-list"] {
+    background: #0f172a !important;
+    color: #e5e7eb !important;
+    border-color: #334155 !important;
+    box-shadow: none !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"] div,
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"] li[role="option"] {
+    background: #0f172a !important;
+    color: #e5e7eb !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [class*="menu-notice"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [class*="notice"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [class*="no-options"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [aria-live="polite"],
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [aria-live="assertive"] {
+    background: #0f172a !important;
+    color: #94a3b8 !important;
+  }
+  /* Opcional: se não há opções, colapsa painel vazio. */
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:has([role="listbox"]:not(:has(li[role="option"]))) {
+    display: none !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"]:not(:has(li[role="option"])) {
+    display: none !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:has([class*="menu-notice"]),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"]:has([class*="menu-notice"]),
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:has([class*="notice"]),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"]:has([class*="notice"]),
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:has([class*="no-options"]),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"]:has([class*="no-options"]) {
+    display: none !important;
+  }
+}
+/* Fallback sem :has: aplica fundo completo para evitar faixa escura. */
+@supports not selector(:has(*)) {
+  body [data-baseweb="popover"],
+  body [data-baseweb="menu"],
+  body [role="listbox"],
+  body [id*="react-select"][class*="-menu"],
+  body [id*="react-select"][class*="-menu-list"] {
+    background: #0f172a !important;
+    color: #e5e7eb !important;
+    border-color: #334155 !important;
+    box-shadow: none !important;
+  }
+  body [role="listbox"] div,
+  body [role="listbox"] li[role="option"] {
+    background: #0f172a !important;
+    color: #e5e7eb !important;
+  }
+  body [class*="menu-notice"],
+  body [class*="notice"],
+  body [class*="no-options"],
+  body [aria-live="polite"],
+  body [aria-live="assertive"] {
+    background: #0f172a !important;
+    color: #94a3b8 !important;
+    min-height: 1.4rem !important;
+    padding: 0.2rem 0.45rem !important;
+  }
+}
+/* Remove o dropdown do comparador (não exibir sugestões / no-results). */
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="menu"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [id*="react-select"][class*="-menu"],
+div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [id*="react-select"][class*="-menu-list"] {
+  display: none !important;
+}
+@supports selector(:has(*)) {
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [data-baseweb="popover"]:not(:has([role="option"])),
+  div.st-key-cmp_multiselect_top [data-testid="stMultiSelect"] [role="listbox"]:not(:has([role="option"])) {
+    display: none !important;
+  }
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [data-baseweb="popover"]:not(:has([role="option"])),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [data-baseweb="popover"]:not(:has([role="option"])),
+  body:has(div.st-key-cmp_multiselect_top [aria-expanded="true"]) [role="listbox"]:not(:has([role="option"])),
+  body:has(div.st-key-cmp_multiselect_top [role="combobox"][aria-expanded="true"]) [role="listbox"]:not(:has([role="option"])) {
+    display: none !important;
+  }
+}
+</style>
+"""
+    st.markdown(css, unsafe_allow_html=True)
 
 
 def compute_portfolio(
@@ -1736,18 +2092,48 @@ div[data-baseweb="base-input"] input,
   color: #111827 !important;
   border-color: #cbd5e1 !important;
 }
-[data-testid="stSelectbox"] [data-baseweb="select"] > div {
+[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div {
   background-color: #ffffff !important;
   color: #111827 !important;
   border-color: #cbd5e1 !important;
 }
 [data-testid="stSelectbox"] [data-baseweb="select"] input,
 [data-testid="stSelectbox"] [data-baseweb="select"] span,
-[data-testid="stSelectbox"] [data-baseweb="select"] div {
+[data-testid="stSelectbox"] [data-baseweb="select"] div,
+[data-testid="stMultiSelect"] [data-baseweb="select"] input,
+[data-testid="stMultiSelect"] [data-baseweb="select"] span,
+[data-testid="stMultiSelect"] [data-baseweb="select"] div {
   color: #111827 !important;
 }
-[data-testid="stSelectbox"] svg {
+[data-testid="stSelectbox"] svg,
+[data-testid="stMultiSelect"] svg {
   fill: #64748b !important;
+}
+/* O app roda com theme.base="dark"; stMultiSelect precisa override explícito. */
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div:focus-within,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div:hover {
+  border-color: #94a3b8 !important;
+  box-shadow: none !important;
+}
+[data-testid="stMultiSelect"] [data-baseweb="popover"],
+[data-testid="stMultiSelect"] [data-baseweb="menu"],
+[data-testid="stMultiSelect"] [role="listbox"] {
+  background: #ffffff !important;
+  color: #111827 !important;
+  border-color: #cbd5e1 !important;
+}
+[data-testid="stMultiSelect"] [role="listbox"] div,
+[data-testid="stMultiSelect"] li[role="option"] {
+  background: #ffffff !important;
+  color: #111827 !important;
+}
+[data-testid="stMultiSelect"] li[role="option"][aria-selected="true"] {
+  background: #eef2ff !important;
+}
+[data-testid="stMultiSelect"] [data-baseweb="menu"] [id*="react-select"][class*="notice"] {
+  color: #334155 !important;
+  background: #ffffff !important;
 }
 section[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
 section[data-testid="stSidebar"] [data-testid="stTextInput"] [data-baseweb="input"] > div,
@@ -2100,18 +2486,47 @@ div[data-baseweb="base-input"] input,
   color: #e5e7eb !important;
   border-color: #374151 !important;
 }
-[data-testid="stSelectbox"] [data-baseweb="select"] > div {
-  background-color: #111827 !important;
+[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+  background-color: #0f172a !important;
   color: #e5e7eb !important;
-  border-color: #374151 !important;
+  border-color: #223041 !important;
 }
 [data-testid="stSelectbox"] [data-baseweb="select"] input,
 [data-testid="stSelectbox"] [data-baseweb="select"] span,
-[data-testid="stSelectbox"] [data-baseweb="select"] div {
+[data-testid="stSelectbox"] [data-baseweb="select"] div,
+[data-testid="stMultiSelect"] [data-baseweb="select"] input,
+[data-testid="stMultiSelect"] [data-baseweb="select"] span,
+[data-testid="stMultiSelect"] [data-baseweb="select"] div {
   color: #e5e7eb !important;
 }
-[data-testid="stSelectbox"] svg {
+[data-testid="stSelectbox"] svg,
+[data-testid="stMultiSelect"] svg {
   fill: #94a3b8 !important;
+}
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div:focus-within,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div:hover {
+  border-color: #475569 !important;
+  box-shadow: none !important;
+}
+[data-testid="stMultiSelect"] [data-baseweb="popover"],
+[data-testid="stMultiSelect"] [data-baseweb="menu"],
+[data-testid="stMultiSelect"] [role="listbox"] {
+  background: #0f172a !important;
+  color: #e5e7eb !important;
+  border-color: #334155 !important;
+}
+[data-testid="stMultiSelect"] [role="listbox"] div,
+[data-testid="stMultiSelect"] li[role="option"] {
+  background: #0f172a !important;
+  color: #e5e7eb !important;
+}
+[data-testid="stMultiSelect"] li[role="option"][aria-selected="true"] {
+  background: #1f2937 !important;
+}
+[data-testid="stMultiSelect"] [data-baseweb="menu"] [id*="react-select"][class*="notice"] {
+  color: #94a3b8 !important;
+  background: #0f172a !important;
 }
 section[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
 section[data-testid="stSidebar"] [data-testid="stTextInput"] [data-baseweb="input"] > div,
@@ -2641,6 +3056,9 @@ if app_mode == "Comparador de Ativos":
         default=st.session_state.comparison_list,
         key="cmp_multiselect_top",
     )
+    _render_compare_multiselect_css(_is_light_theme_active())
+    cmp_spacer_rem = 0.4
+    st.markdown(f"<div style='height:{cmp_spacer_rem:.1f}rem'></div>", unsafe_allow_html=True)
 
     if st.button("Comparar ativos", key="cmp_run_btn_top"):
         cmp_df = pd.DataFrame(
@@ -2726,24 +3144,31 @@ if app_mode == "Comparador de Ativos":
 
         stats_df = pd.DataFrame(cmp_stats).sort_values("CAGR (%)", ascending=False)
         risk_df = pd.DataFrame(risk_rows)
+        stats_df_display = (
+            stats_df.drop(columns=["Link FT Summary", "Link FT Risk"], errors="ignore")
+            .rename(columns={"ISIN": "Ativo"})
+            .round(2)
+        )
         st.subheader("Métricas históricas (calculadas)")
-        st.dataframe(
-            stats_df.round(2),
-            use_container_width=True,
-            column_config={
-                "Link FT Summary": st.column_config.LinkColumn("Link FT Summary"),
-                "Link FT Risk": st.column_config.LinkColumn("Link FT Risk"),
-            },
+        _render_compare_grid_table(stats_df_display)
+
+        risk_df_display = (
+            risk_df.drop(columns=["Link FT Summary", "Link FT Risk"], errors="ignore")
+            .rename(columns={"ISIN": "Ativo"})
+            .copy()
         )
+        numeric_cols = risk_df_display.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            risk_df_display[numeric_cols] = risk_df_display[numeric_cols].round(2)
         st.subheader("Risco FT (Risk tab)")
-        st.dataframe(
-            risk_df,
-            use_container_width=True,
-            column_config={
-                "Link FT Summary": st.column_config.LinkColumn("Link FT Summary"),
-                "Link FT Risk": st.column_config.LinkColumn("Link FT Risk"),
-            },
-        )
+        _render_compare_grid_table(risk_df_display)
+
+        if not risk_df.empty and {"Fundo", "ISIN", "Link FT Summary", "Link FT Risk"}.issubset(risk_df.columns):
+            links_df = risk_df.rename(columns={"Link FT Summary": "FT Summary", "Link FT Risk": "FT Risk"})[
+                ["Fundo", "ISIN", "FT Summary", "FT Risk"]
+            ]
+            st.subheader("Links Financial Times")
+            _render_ft_links_table(links_df)
     st.stop()
 
 default_isins = []
@@ -3474,6 +3899,7 @@ if export_pdf:
         use_container_width=True,
         key=f"download_pdf_{pdf_filename}",
     )
+
 
 
 
