@@ -19,6 +19,8 @@ carteiras.json
 build/
 dist/
 *.spec
+!streamlit_searchbox_local/frontend/build/
+!streamlit_searchbox_local/frontend/build/**
 
 # IDE
 .vscode/
